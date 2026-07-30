@@ -52,7 +52,11 @@
   .dh { font-size: 10px; text-align: center; color: #363636; font-weight: 600; letter-spacing: 0.04em; }
   .dh .dh-date { display:block; font-weight: 500; color: var(--text-secondary); font-size: 9px; margin-top:1px; }
   .day-grid { display: grid; grid-template-columns: repeat(7, minmax(0,1fr)); gap: 4px; }
-  .cell-wrap { display: flex; flex-direction: column; gap: 3px; min-height: 46px; }
+  .cell-wrap { display: flex; flex-direction: column; gap: 3px; min-height: 46px; border-radius: var(--radius-sm); transition: box-shadow 0.12s ease, background 0.12s ease; }
+  .cell-wrap.draggable-day { cursor: grab; }
+  .cell-wrap.draggable-day:active { cursor: grabbing; }
+  .cell-wrap.dragging { opacity: 0.4; }
+  .cell-wrap.drag-over { box-shadow: 0 0 0 2px #c8a800; background: rgba(200,168,0,0.08); }
 
   .day { position: relative; font-size: 10px; text-align: center; padding: 5px 2px 4px; border-radius: var(--radius-sm); cursor: default; user-select: none; transition: transform 0.1s ease; flex: 1; display: flex; flex-direction: column; justify-content: center; background: #fff; }
   .day.clickable { cursor: pointer; }
@@ -154,7 +158,7 @@
   // 1. SUPABASE CONFIG — fill these in after running SETUP.md, then reload.
   // ══════════════════════════════════════════════════════════════════════════
   const SUPABASE_URL = 'https://ybelmjtwgqwzrbzzxawu.supabase.co';
-  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InliZWxtanR3Z3F3enJienp4YXd1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3NDEzMjUsImV4cCI6MjEwMDMxNzMyNX0.uYOK4YyF1pQ7IfARfD_BTbHnhUwlx2UXLTx82-axFqQ';
+  const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InliZWxtanR3Z3F3enJienp4YXd1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ3NDEzMjUsImV4cCI6MjEwMDMxNzMyNX0.uYOK4YyF1pQ7IfARfD_BTbHnhUwlx2UXLTx82-axFqQ'
   const DEMO_MODE = !SUPABASE_URL || !SUPABASE_ANON_KEY;
 
   let supabaseClient = null;
@@ -177,6 +181,21 @@
   // completed[cellKey] = true/false, cellKey = person::date::workout_type
   const completed = {};
   function cellKey(person, date, type) { return person + '::' + date + '::' + type; }
+
+  // Track each person's original plan date range, so a date that ends up with
+  // no entries after a reschedule (e.g. a workout was dragged away) still
+  // renders as "Rest" instead of a blank empty-slot, as long as it falls
+  // inside that person's plan window.
+  PEOPLE.forEach(p => {
+    if (!p.entries || !p.entries.length) { p.minDate = null; p.maxDate = null; return; }
+    const dates = p.entries.map(e => e.date).slice().sort();
+    p.minDate = dates[0];
+    p.maxDate = dates[dates.length - 1];
+  });
+
+  // dragState tracks an in-progress day reschedule: which person's day is
+  // being picked up, and from which date.
+  let dragState = null;
 
   // ══════════════════════════════════════════════════════════════════════════
   // 3. DATE HELPERS
@@ -267,6 +286,88 @@
     return cell;
   }
 
+  // Builds the wrap for a single (person, date) column, including a synthetic
+  // "Rest" placeholder when a date inside the person's plan window has no
+  // entries (this happens after a reschedule drags the only workout away),
+  // and wires up drag-and-drop for that person's own row.
+  function buildDayWrap(person, dateIso, canEditRow) {
+    const wrap = document.createElement('div');
+    wrap.className = 'cell-wrap';
+    wrap.dataset.date = dateIso;
+
+    let dayEntries = entriesForDate(person, dateIso);
+    const inRange = person.minDate && dateIso >= person.minDate && dateIso <= person.maxDate;
+    if (dayEntries.length === 0 && inRange) {
+      dayEntries = [{ workout_type: 'rest', label: 'Rest', sub_label: '', emoji: '', is_rest: true, pills: [] }];
+    }
+
+    if (dayEntries.length === 0) {
+      wrap.appendChild(makeDayCell(person, null, dateIso));
+    } else {
+      dayEntries.forEach(entry => wrap.appendChild(makeDayCell(person, entry, dateIso)));
+    }
+
+    const canMove = canEditRow && dayEntries.some(e => !e.is_rest);
+    if (canMove) wrap.classList.add('draggable-day');
+    wrap.draggable = canMove;
+
+    wrap.addEventListener('dragstart', () => {
+      if (!canMove) return;
+      dragState = { personKey: person.key, date: dateIso };
+      wrap.classList.add('dragging');
+    });
+    wrap.addEventListener('dragend', () => wrap.classList.remove('dragging'));
+
+    if (canEditRow) {
+      wrap.addEventListener('dragover', (ev) => {
+        if (!dragState || dragState.personKey !== person.key) return;
+        ev.preventDefault();
+        wrap.classList.add('drag-over');
+      });
+      wrap.addEventListener('dragleave', () => wrap.classList.remove('drag-over'));
+      wrap.addEventListener('drop', (ev) => {
+        ev.preventDefault();
+        wrap.classList.remove('drag-over');
+        if (!dragState || dragState.personKey !== person.key) return;
+        const sourceDate = dragState.date;
+        const targetDate = dateIso;
+        dragState = null;
+        if (sourceDate === targetDate) return;
+        swapDay(person, sourceDate, targetDate);
+        renderBoard();
+        persistSwap(person, sourceDate, targetDate);
+      });
+    }
+
+    return wrap;
+  }
+
+  function updateRowProgress(rowEl) {
+    const progEl = rowEl.querySelector('.person-progress');
+    if (!progEl) return;
+    let total = 0, done = 0;
+    rowEl.querySelectorAll('.day:not(.empty-slot):not(.restlike)').forEach(c => {
+      total++;
+      if (completed[c.dataset.cellkey]) done++;
+    });
+    progEl.textContent = done + ' / ' + total + ' this week';
+  }
+
+  // Rebuilds just one person's one day-column (used after a realtime
+  // structural change — a reschedule someone else made — so we don't have to
+  // re-render the whole board and risk disrupting anything else in progress).
+  function rerenderDayColumn(person, dateIso) {
+    const rowEl = document.querySelector('.person-row[data-person="' + person.key + '"]');
+    if (!rowEl) return; // that week isn't currently on screen — nothing to update
+    const oldWrap = rowEl.querySelector('.cell-wrap[data-date="' + dateIso + '"]');
+    if (!oldWrap) return;
+    const canEditRow = ME === person.key;
+    const newWrap = buildDayWrap(person, dateIso, canEditRow);
+    oldWrap.replaceWith(newWrap);
+    updateRowProgress(rowEl);
+    checkTeamCelebration();
+  }
+
   function renderBoard() {
     const monday = addDays(thisMonday, weekOffset * 7);
     renderDayHeader(monday);
@@ -291,14 +392,15 @@
       const row = document.createElement('div');
       row.className = 'person-row';
       row.dataset.person = person.key;
-      if (ME === person.key) row.classList.add('is-me');
+      const canEditRow = ME === person.key;
+      if (canEditRow) row.classList.add('is-me');
 
       const top = document.createElement('div');
       top.className = 'person-top';
       const nameEl = document.createElement('span');
       nameEl.className = 'person-name';
       nameEl.textContent = person.name;
-      if (ME === person.key) {
+      if (canEditRow) {
         const tag = document.createElement('span');
         tag.className = 'me-tag'; tag.textContent = 'YOU';
         nameEl.appendChild(tag);
@@ -312,34 +414,19 @@
       const grid = document.createElement('div');
       grid.className = 'day-grid';
 
-      let doneCount = 0, totalCount = 0;
       for (let i = 0; i < 7; i++) {
         const d = addDays(monday, i);
         const dIso = isoDate(d);
-        const wrap = document.createElement('div');
-        wrap.className = 'cell-wrap';
-        const dayEntries = entriesForDate(person, dIso);
-        if (dayEntries.length === 0) {
-          wrap.appendChild(makeDayCell(person, null, dIso));
-        } else {
-          dayEntries.forEach(entry => {
-            wrap.appendChild(makeDayCell(person, entry, dIso));
-            if (!entry.is_rest) {
-              totalCount++;
-              if (completed[cellKey(person.key, dIso, entry.workout_type)]) doneCount++;
-            }
-          });
-        }
-        grid.appendChild(wrap);
+        grid.appendChild(buildDayWrap(person, dIso, canEditRow));
       }
-      progEl.textContent = doneCount + ' / ' + totalCount + ' this week';
       row.appendChild(grid);
       board.appendChild(row);
+      updateRowProgress(row);
     });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 5. TOGGLE + SYNC
+  // 5. TOGGLE + RESCHEDULE + SYNC
   // ══════════════════════════════════════════════════════════════════════════
   function spawnEmoji(emoji, el) {
     const rect = el.getBoundingClientRect();
@@ -397,8 +484,6 @@
     document.querySelectorAll('.person-row .day:not(.empty-slot)').forEach(cell => {
       const key = cell.dataset.cellkey;
       if (!key) return;
-      const type = key.split('::')[2];
-      // rest cells have no clickable state tracked as "workout"; skip by checking class
       if (cell.classList.contains('restlike')) return;
       total++;
       if (completed[key]) done++;
@@ -415,17 +500,8 @@
     completed[key] = newVal;
     cellEl.classList.toggle('done', newVal);
 
-    // update the progress counter for this row without a full re-render
     const row = cellEl.closest('.person-row');
-    if (row) {
-      const progEl = row.querySelector('.person-progress');
-      let total = 0, done = 0;
-      row.querySelectorAll('.day:not(.empty-slot):not(.restlike)').forEach(c => {
-        total++;
-        if (completed[c.dataset.cellkey]) done++;
-      });
-      progEl.textContent = done + ' / ' + total + ' this week';
-    }
+    if (row) updateRowProgress(row);
 
     if (newVal) spawnEmoji(entry.emoji || '✅', cellEl);
 
@@ -449,7 +525,55 @@
     checkTeamCelebration();
   }
 
-  // Realtime: patch only the affected cell, never re-render the whole board.
+  // Swaps ALL of one date's entries with ALL of another date's entries, for a
+  // single person, mutating person.entries in place and carrying each
+  // workout's completed-state along with it (the checkmark belongs to the
+  // workout instance, not the calendar date). This is a whole-day swap, not a
+  // single-workout move — see SETUP.md for why.
+  function swapDay(person, dateA, dateB) {
+    if (dateA === dateB) return;
+    const entriesA = person.entries.filter(e => e.date === dateA);
+    const entriesB = person.entries.filter(e => e.date === dateB);
+
+    const savedA = {}; entriesA.forEach(e => { if (!e.is_rest) savedA[e.workout_type] = completed[cellKey(person.key, dateA, e.workout_type)]; });
+    const savedB = {}; entriesB.forEach(e => { if (!e.is_rest) savedB[e.workout_type] = completed[cellKey(person.key, dateB, e.workout_type)]; });
+
+    entriesA.forEach(e => { if (!e.is_rest) delete completed[cellKey(person.key, dateA, e.workout_type)]; e.date = dateB; });
+    entriesB.forEach(e => { if (!e.is_rest) delete completed[cellKey(person.key, dateB, e.workout_type)]; e.date = dateA; });
+
+    entriesA.forEach(e => { if (!e.is_rest) completed[cellKey(person.key, e.date, e.workout_type)] = !!savedA[e.workout_type]; });
+    entriesB.forEach(e => { if (!e.is_rest) completed[cellKey(person.key, e.date, e.workout_type)] = !!savedB[e.workout_type]; });
+  }
+
+  async function persistSwap(person, dateA, dateB) {
+    if (DEMO_MODE) return;
+    try {
+      await supabaseClient.from('workouts').delete().eq('person', person.key).in('date', [dateA, dateB]);
+      const rows = [];
+      [dateA, dateB].forEach(d => {
+        entriesForDate(person, d).forEach(e => {
+          if (e.is_rest) return;
+          rows.push({
+            person: person.key, date: d, workout_type: e.workout_type,
+            label: e.label, sub_label: e.sub_label || null, emoji: e.emoji || null,
+            completed: !!completed[cellKey(person.key, d, e.workout_type)],
+            updated_at: new Date().toISOString(),
+          });
+        });
+      });
+      if (rows.length) {
+        await supabaseClient.from('workouts').upsert(rows, { onConflict: 'person,date,workout_type' });
+      }
+    } catch (err) {
+      console.error('Reschedule sync failed:', err);
+    }
+  }
+
+  // Realtime: a pure completed-toggle (same person/date/workout_type before
+  // and after) gets a lightweight single-cell patch. Anything structural — a
+  // reschedule shows up as a DELETE plus a re-INSERT — triggers a resync of
+  // just the affected date column(s) for that person, so a swap made by one
+  // person shows up correctly for everyone else too.
   function patchFromRemote(row) {
     const key = cellKey(row.person, row.date, row.workout_type);
     completed[key] = !!row.completed;
@@ -457,17 +581,50 @@
     if (cellEl) {
       cellEl.classList.toggle('done', !!row.completed);
       const rowEl = cellEl.closest('.person-row');
-      if (rowEl) {
-        const progEl = rowEl.querySelector('.person-progress');
-        let total = 0, done = 0;
-        rowEl.querySelectorAll('.day:not(.empty-slot):not(.restlike)').forEach(c => {
-          total++;
-          if (completed[c.dataset.cellkey]) done++;
-        });
-        progEl.textContent = done + ' / ' + total + ' this week';
-      }
+      if (rowEl) updateRowProgress(rowEl);
     }
     checkTeamCelebration();
+  }
+
+  async function resyncDayFromServer(person, dateIso) {
+    if (!dateIso) return;
+    try {
+      const { data, error } = await supabaseClient.from('workouts')
+        .select('date,workout_type,label,sub_label,emoji,completed')
+        .eq('person', person.key).eq('date', dateIso);
+      if (error) { console.error(error); return; }
+      person.entries = person.entries.filter(e => !(e.date === dateIso && !e.is_rest));
+      (data || []).forEach(r => {
+        person.entries.push({
+          date: r.date, workout_type: r.workout_type, label: r.label,
+          sub_label: r.sub_label || '', emoji: r.emoji || '', is_rest: false, pills: [],
+        });
+        completed[cellKey(person.key, r.date, r.workout_type)] = !!r.completed;
+      });
+      rerenderDayColumn(person, dateIso);
+    } catch (err) {
+      console.error('Resync failed:', err);
+    }
+  }
+
+  function subscribeRealtime() {
+    if (DEMO_MODE) return;
+    supabaseClient.channel('workouts-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'workouts' }, payload => {
+        const person = PEOPLE.find(p => p.key === (payload.new || payload.old || {}).person);
+        if (!person) return;
+        const isPureToggle = payload.eventType === 'UPDATE' && payload.old && payload.new &&
+          payload.old.date === payload.new.date && payload.old.workout_type === payload.new.workout_type;
+        if (isPureToggle) {
+          patchFromRemote(payload.new);
+        } else {
+          const dates = new Set();
+          if (payload.old && payload.old.date) dates.add(payload.old.date);
+          if (payload.new && payload.new.date) dates.add(payload.new.date);
+          dates.forEach(d => resyncDayFromServer(person, d));
+        }
+      })
+      .subscribe();
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -495,15 +652,6 @@
     const { data, error } = await supabaseClient.from('workouts').select('person,date,workout_type,completed').in('person', keys);
     if (error) { console.error(error); return; }
     (data || []).forEach(r => { completed[cellKey(r.person, r.date, r.workout_type)] = !!r.completed; });
-  }
-
-  function subscribeRealtime() {
-    if (DEMO_MODE) return;
-    supabaseClient.channel('workouts-changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'workouts' }, payload => {
-        if (payload.new) patchFromRemote(payload.new);
-      })
-      .subscribe();
   }
 
   async function init() {
