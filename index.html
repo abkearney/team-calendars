@@ -220,6 +220,20 @@
     }, 350);
   }
 
+  // Safety net: collapses person.entries down to at most one entry per
+  // (date, workout_type) — and at most one rest placeholder per date — no
+  // matter how it got duplicated. Called after every operation that mutates
+  // person.entries, so a glitch can never compound across further reschedules.
+  function dedupeEntries(person) {
+    const seen = new Set();
+    person.entries = person.entries.filter(e => {
+      const k = e.date + '::' + e.workout_type + (e.is_rest ? '::rest' : '::w');
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // 3. DATE HELPERS
   // ══════════════════════════════════════════════════════════════════════════
@@ -568,10 +582,13 @@
 
     entriesA.forEach(e => { if (!e.is_rest) completed[cellKey(person.key, e.date, e.workout_type)] = !!savedA[e.workout_type]; });
     entriesB.forEach(e => { if (!e.is_rest) completed[cellKey(person.key, e.date, e.workout_type)] = !!savedB[e.workout_type]; });
+
+    dedupeEntries(person);
   }
 
   async function persistSwap(person, dateA, dateB) {
     if (DEMO_MODE) return;
+    dedupeEntries(person);
     try {
       await supabaseClient.from('workouts').delete().eq('person', person.key).in('date', [dateA, dateB]);
       const rows = [];
@@ -626,6 +643,7 @@
         });
         completed[cellKey(person.key, r.date, r.workout_type)] = !!r.completed;
       });
+      dedupeEntries(person);
       rerenderDayColumn(person, dateIso);
     } catch (err) {
       console.error('Resync failed:', err);
@@ -705,6 +723,7 @@
       const movedInDates = new Set(freshEntries.map(e => e.date));
       const keptRestEntries = person.entries.filter(e => e.is_rest && !movedInDates.has(e.date));
       person.entries = keptRestEntries.concat(freshEntries);
+      dedupeEntries(person);
       data.forEach(r => { completed[cellKey(person.key, r.date, r.workout_type)] = !!r.completed; });
     } catch (err) {
       console.error('Schedule load failed for', person.key, err);
