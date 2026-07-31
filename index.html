@@ -197,6 +197,29 @@
   // being picked up, and from which date.
   let dragState = null;
 
+  // A write this tab just made to Supabase will echo back over the realtime
+  // channel. We already know our own result, so we suppress reacting to our
+  // own echoes for a few seconds (recentLocalWrites), and separately debounce
+  // any resync we DO run (scheduleResync/resyncTimers) so that a burst of
+  // multi-row change events for the same date — e.g. from someone else's
+  // reschedule — collapses into a single fetch instead of several overlapping
+  // ones that could each push the same rows again.
+  const recentLocalWrites = new Set(); // "personKey::date"
+  function markLocalWrite(personKey, dateIso) {
+    const k = personKey + '::' + dateIso;
+    recentLocalWrites.add(k);
+    setTimeout(() => recentLocalWrites.delete(k), 4000);
+  }
+  const resyncTimers = {};
+  function scheduleResync(person, dateIso) {
+    const key = person.key + '::' + dateIso;
+    if (resyncTimers[key]) clearTimeout(resyncTimers[key]);
+    resyncTimers[key] = setTimeout(() => {
+      delete resyncTimers[key];
+      resyncDayFromServer(person, dateIso);
+    }, 350);
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // 3. DATE HELPERS
   // ══════════════════════════════════════════════════════════════════════════
@@ -335,6 +358,8 @@
         if (sourceDate === targetDate) return;
         swapDay(person, sourceDate, targetDate);
         renderBoard();
+        markLocalWrite(person.key, sourceDate);
+        markLocalWrite(person.key, targetDate);
         persistSwap(person, sourceDate, targetDate);
       });
     }
@@ -621,7 +646,10 @@
           const dates = new Set();
           if (payload.old && payload.old.date) dates.add(payload.old.date);
           if (payload.new && payload.new.date) dates.add(payload.new.date);
-          dates.forEach(d => resyncDayFromServer(person, d));
+          dates.forEach(d => {
+            if (recentLocalWrites.has(person.key + '::' + d)) return; // our own echo — already correct locally
+            scheduleResync(person, d);
+          });
         }
       })
       .subscribe();
@@ -654,6 +682,35 @@
     (data || []).forEach(r => { completed[cellKey(r.person, r.date, r.workout_type)] = !!r.completed; });
   }
 
+  // Reschedules only take effect for a client for the rest of that browser
+  // session unless we also fetch each person's CURRENT schedule (not just
+  // completed flags) on load. This runs once per person at page load, and
+  // replaces the embedded plan's non-rest entries with whatever Supabase
+  // currently has for them — if that person has been seeded at least once.
+  // A stale rest placeholder is dropped for any date that now has a real
+  // workout on it, to avoid a day showing "Rest" stacked next to a workout
+  // that got rescheduled into it.
+  async function loadPersonScheduleFromSupabase(person) {
+    if (DEMO_MODE || person.pending) return;
+    try {
+      const { data, error } = await supabaseClient.from('workouts')
+        .select('date,workout_type,label,sub_label,emoji,completed')
+        .eq('person', person.key);
+      if (error) { console.error(error); return; }
+      if (!data || data.length === 0) return; // never seeded yet — keep the embedded defaults
+      const freshEntries = data.map(r => ({
+        date: r.date, workout_type: r.workout_type, label: r.label,
+        sub_label: r.sub_label || '', emoji: r.emoji || '', is_rest: false, pills: [],
+      }));
+      const movedInDates = new Set(freshEntries.map(e => e.date));
+      const keptRestEntries = person.entries.filter(e => e.is_rest && !movedInDates.has(e.date));
+      person.entries = keptRestEntries.concat(freshEntries);
+      data.forEach(r => { completed[cellKey(person.key, r.date, r.workout_type)] = !!r.completed; });
+    } catch (err) {
+      console.error('Schedule load failed for', person.key, err);
+    }
+  }
+
   async function init() {
     document.getElementById('viewer-name').textContent =
       ME ? (PEOPLE.find(p => p.key === ME)?.name || ME) : 'Read-only';
@@ -661,6 +718,7 @@
     document.getElementById('banner-noviewer').classList.toggle('show', !ME);
 
     if (!DEMO_MODE) {
+      await Promise.all(PEOPLE.filter(p => !p.pending).map(p => loadPersonScheduleFromSupabase(p)));
       await loadCompletedFromSupabase();
       const mine = PEOPLE.find(p => p.key === ME);
       if (mine) await seedMyEntries(mine);
