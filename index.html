@@ -197,29 +197,6 @@
   // being picked up, and from which date.
   let dragState = null;
 
-  // A write this tab just made to Supabase will echo back over the realtime
-  // channel. We already know our own result, so we suppress reacting to our
-  // own echoes for a few seconds (recentLocalWrites), and separately debounce
-  // any resync we DO run (scheduleResync/resyncTimers) so that a burst of
-  // multi-row change events for the same date — e.g. from someone else's
-  // reschedule — collapses into a single fetch instead of several overlapping
-  // ones that could each push the same rows again.
-  const recentLocalWrites = new Set(); // "personKey::date"
-  function markLocalWrite(personKey, dateIso) {
-    const k = personKey + '::' + dateIso;
-    recentLocalWrites.add(k);
-    setTimeout(() => recentLocalWrites.delete(k), 4000);
-  }
-  const resyncTimers = {};
-  function scheduleResync(person, dateIso) {
-    const key = person.key + '::' + dateIso;
-    if (resyncTimers[key]) clearTimeout(resyncTimers[key]);
-    resyncTimers[key] = setTimeout(() => {
-      delete resyncTimers[key];
-      resyncDayFromServer(person, dateIso);
-    }, 350);
-  }
-
   // Safety net: collapses person.entries down to at most one entry per
   // (date, workout_type) — and at most one rest placeholder per date — no
   // matter how it got duplicated. Called after every operation that mutates
@@ -372,8 +349,6 @@
         if (sourceDate === targetDate) return;
         swapDay(person, sourceDate, targetDate);
         renderBoard();
-        markLocalWrite(person.key, sourceDate);
-        markLocalWrite(person.key, targetDate);
         persistSwap(person, sourceDate, targetDate);
       });
     }
@@ -390,21 +365,6 @@
       if (completed[c.dataset.cellkey]) done++;
     });
     progEl.textContent = done + ' / ' + total + ' this week';
-  }
-
-  // Rebuilds just one person's one day-column (used after a realtime
-  // structural change — a reschedule someone else made — so we don't have to
-  // re-render the whole board and risk disrupting anything else in progress).
-  function rerenderDayColumn(person, dateIso) {
-    const rowEl = document.querySelector('.person-row[data-person="' + person.key + '"]');
-    if (!rowEl) return; // that week isn't currently on screen — nothing to update
-    const oldWrap = rowEl.querySelector('.cell-wrap[data-date="' + dateIso + '"]');
-    if (!oldWrap) return;
-    const canEditRow = ME === person.key;
-    const newWrap = buildDayWrap(person, dateIso, canEditRow);
-    oldWrap.replaceWith(newWrap);
-    updateRowProgress(rowEl);
-    checkTeamCelebration();
   }
 
   function renderBoard() {
@@ -545,7 +505,6 @@
     if (newVal) spawnEmoji(entry.emoji || '✅', cellEl);
 
     if (!DEMO_MODE) {
-      markLocalWrite(person.key, dateIso);
       try {
         await supabaseClient.from('workouts').upsert({
           person: person.key,
@@ -612,11 +571,16 @@
     }
   }
 
-  // Realtime: a pure completed-toggle (same person/date/workout_type before
-  // and after) gets a lightweight single-cell patch. Anything structural — a
-  // reschedule shows up as a DELETE plus a re-INSERT — triggers a resync of
-  // just the affected date column(s) for that person, so a swap made by one
-  // person shows up correctly for everyone else too.
+  // Realtime: patches ONLY the completed on/off state of a single existing
+  // cell, keyed by person+date+workout_type. It never adds or removes
+  // entries from person.entries — that's deliberate. Reschedules (which DO
+  // change entries) are picked up on next page load via
+  // loadPersonScheduleFromSupabase instead of live, which trades away
+  // instant cross-tab reschedule updates for guaranteed no-duplication.
+  // Because this never touches person.entries, it's safe to run even for a
+  // tab's own echo of its own write — flipping a checkbox to a value it's
+  // already at, or updating a cell that isn't currently on screen (a no-op,
+  // since the querySelector just won't find it), can't cause any corruption.
   function patchFromRemote(row) {
     const key = cellKey(row.person, row.date, row.workout_type);
     completed[key] = !!row.completed;
@@ -629,47 +593,12 @@
     checkTeamCelebration();
   }
 
-  async function resyncDayFromServer(person, dateIso) {
-    if (!dateIso) return;
-    try {
-      const { data, error } = await supabaseClient.from('workouts')
-        .select('date,workout_type,label,sub_label,emoji,completed')
-        .eq('person', person.key).eq('date', dateIso);
-      if (error) { console.error(error); return; }
-      person.entries = person.entries.filter(e => !(e.date === dateIso && !e.is_rest));
-      (data || []).forEach(r => {
-        person.entries.push({
-          date: r.date, workout_type: r.workout_type, label: r.label,
-          sub_label: r.sub_label || '', emoji: r.emoji || '', is_rest: false, pills: [],
-        });
-        completed[cellKey(person.key, r.date, r.workout_type)] = !!r.completed;
-      });
-      dedupeEntries(person);
-      rerenderDayColumn(person, dateIso);
-    } catch (err) {
-      console.error('Resync failed:', err);
-    }
-  }
-
   function subscribeRealtime() {
     if (DEMO_MODE) return;
     supabaseClient.channel('workouts-changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'workouts' }, payload => {
-        const person = PEOPLE.find(p => p.key === (payload.new || payload.old || {}).person);
-        if (!person) return;
-        const isPureToggle = payload.eventType === 'UPDATE' && payload.old && payload.new &&
-          payload.old.date === payload.new.date && payload.old.workout_type === payload.new.workout_type;
-        if (isPureToggle) {
-          patchFromRemote(payload.new);
-        } else {
-          const dates = new Set();
-          if (payload.old && payload.old.date) dates.add(payload.old.date);
-          if (payload.new && payload.new.date) dates.add(payload.new.date);
-          dates.forEach(d => {
-            if (recentLocalWrites.has(person.key + '::' + d)) return; // our own echo — already correct locally
-            scheduleResync(person, d);
-          });
-        }
+        if (payload.eventType === 'DELETE') return; // structural — resolved on next load, not live
+        if (payload.new) patchFromRemote(payload.new);
       })
       .subscribe();
   }
