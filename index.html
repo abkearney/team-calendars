@@ -638,14 +638,21 @@
   // A stale rest placeholder is dropped for any date that now has a real
   // workout on it, to avoid a day showing "Rest" stacked next to a workout
   // that got rescheduled into it.
+  // Returns true if this person already had rows in Supabase (i.e. has been
+  // seeded before), false if they truly have nothing yet. This return value
+  // is what init() uses to decide whether seeding is safe to run — seeding
+  // must NEVER run again after the first real visit, because it can't tell
+  // "never added yet" apart from "was deliberately moved away by a
+  // reschedule," and re-running it would resurrect entries you'd dragged
+  // elsewhere right back into their original spot.
   async function loadPersonScheduleFromSupabase(person) {
-    if (DEMO_MODE || person.pending) return;
+    if (DEMO_MODE || person.pending) return false;
     try {
       const { data, error } = await supabaseClient.from('workouts')
         .select('date,workout_type,label,sub_label,emoji,completed')
         .eq('person', person.key);
-      if (error) { console.error(error); return; }
-      if (!data || data.length === 0) return; // never seeded yet — keep the embedded defaults
+      if (error) { console.error(error); return false; }
+      if (!data || data.length === 0) return false; // never seeded yet — keep the embedded defaults
       const freshEntries = data.map(r => ({
         date: r.date, workout_type: r.workout_type, label: r.label,
         sub_label: r.sub_label || '', emoji: r.emoji || '', is_rest: false, pills: [],
@@ -655,8 +662,10 @@
       person.entries = keptRestEntries.concat(freshEntries);
       dedupeEntries(person);
       data.forEach(r => { completed[cellKey(person.key, r.date, r.workout_type)] = !!r.completed; });
+      return true;
     } catch (err) {
       console.error('Schedule load failed for', person.key, err);
+      return false;
     }
   }
 
@@ -667,10 +676,13 @@
     document.getElementById('banner-noviewer').classList.toggle('show', !ME);
 
     if (!DEMO_MODE) {
-      await Promise.all(PEOPLE.filter(p => !p.pending).map(p => loadPersonScheduleFromSupabase(p)));
+      const alreadySeeded = {};
+      await Promise.all(PEOPLE.filter(p => !p.pending).map(async p => {
+        alreadySeeded[p.key] = await loadPersonScheduleFromSupabase(p);
+      }));
       await loadCompletedFromSupabase();
       const mine = PEOPLE.find(p => p.key === ME);
-      if (mine) await seedMyEntries(mine);
+      if (mine && !alreadySeeded[mine.key]) await seedMyEntries(mine);
       subscribeRealtime();
     }
 
