@@ -545,6 +545,7 @@
     if (newVal) spawnEmoji(entry.emoji || '✅', cellEl);
 
     if (!DEMO_MODE) {
+      markLocalWrite(person.key, dateIso);
       try {
         await supabaseClient.from('workouts').upsert({
           person: person.key,
